@@ -2,9 +2,6 @@ package ru.maga.urlshortener.service;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.Mock;
-import org.mockito.junit.jupiter.MockitoExtension;
 import ru.maga.urlshortener.config.AppConfig;
 import ru.maga.urlshortener.domain.ShortUrl;
 import ru.maga.urlshortener.repository.ShortUrlRepository;
@@ -16,34 +13,28 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.*;
 
-@ExtendWith(MockitoExtension.class)
+/**
+ * Tests for LinkManagementService using real instances (no mocks).
+ * This approach is more reliable and works with all Java versions.
+ */
 class LinkManagementServiceTest {
 
-    @Mock
     private UserRepository userRepository;
-
-    @Mock
     private ShortUrlRepository shortUrlRepository;
-
-    @Mock
     private UrlShortenerService urlShortenerService;
-
-    @Mock
     private NotificationService notificationService;
-
-    @Mock
     private AppConfig config;
-
     private LinkManagementService service;
 
     @BeforeEach
     void setUp() {
-        when(config.getLinkTtlSeconds()).thenReturn(86400);
-        when(config.getDefaultClickLimit()).thenReturn(100);
+        // Use real instances instead of mocks
+        userRepository = new UserRepository();
+        shortUrlRepository = new ShortUrlRepository();
+        urlShortenerService = new UrlShortenerService(6);
+        notificationService = new NotificationService(false); // Disable for tests
+        config = new AppConfig();
 
         service = new LinkManagementService(
                 userRepository,
@@ -59,42 +50,37 @@ class LinkManagementServiceTest {
         UUID userId = service.createUser();
 
         assertThat(userId).isNotNull();
-        verify(userRepository).save(any());
+        assertThat(userRepository.exists(userId)).isTrue();
     }
 
     @Test
     void shouldCheckUserExists() {
-        UUID userId = UUID.randomUUID();
-        when(userRepository.exists(userId)).thenReturn(true);
+        UUID userId = service.createUser();
 
         boolean exists = service.userExists(userId);
 
         assertThat(exists).isTrue();
+        assertThat(service.userExists(UUID.randomUUID())).isFalse();
     }
 
     @Test
     void shouldCreateShortUrl() {
-        UUID userId = UUID.randomUUID();
+        UUID userId = service.createUser();
         String url = "https://example.com";
-        String shortCode = "abc123";
 
-        when(userRepository.exists(userId)).thenReturn(true);
-        when(urlShortenerService.generateShortCode(url, userId)).thenReturn(shortCode);
-        when(shortUrlRepository.exists(shortCode)).thenReturn(false);
-
-        ShortUrl result = service.createShortUrl(url, userId, null);
+        ShortUrl result = service.createShortUrl(url, userId, 50);
 
         assertThat(result).isNotNull();
-        assertThat(result.getShortCode()).isEqualTo(shortCode);
+        assertThat(result.getShortCode()).isNotNull().hasSize(6);
         assertThat(result.getOriginalUrl()).isEqualTo(url);
         assertThat(result.getOwnerId()).isEqualTo(userId);
-        verify(shortUrlRepository).save(any(ShortUrl.class));
+        assertThat(result.getClickLimit()).isEqualTo(50);
+        assertThat(shortUrlRepository.exists(result.getShortCode())).isTrue();
     }
 
     @Test
     void shouldThrowExceptionWhenCreatingUrlForNonexistentUser() {
         UUID userId = UUID.randomUUID();
-        when(userRepository.exists(userId)).thenReturn(false);
 
         assertThatThrownBy(() -> service.createShortUrl("https://example.com", userId, null))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -103,8 +89,7 @@ class LinkManagementServiceTest {
 
     @Test
     void shouldThrowExceptionForInvalidUrl() {
-        UUID userId = UUID.randomUUID();
-        when(userRepository.exists(userId)).thenReturn(true);
+        UUID userId = service.createUser();
 
         assertThatThrownBy(() -> service.createShortUrl("invalid-url", userId, null))
                 .isInstanceOf(IllegalArgumentException.class);
@@ -112,17 +97,9 @@ class LinkManagementServiceTest {
 
     @Test
     void shouldProcessClickSuccessfully() {
-        String shortCode = "abc123";
-        ShortUrl shortUrl = new ShortUrl(
-                shortCode,
-                "https://example.com",
-                UUID.randomUUID(),
-                Instant.now(),
-                Instant.now().plusSeconds(3600),
-                10
-        );
-
-        when(shortUrlRepository.findByShortCode(shortCode)).thenReturn(Optional.of(shortUrl));
+        UUID userId = service.createUser();
+        ShortUrl shortUrl = service.createShortUrl("https://example.com", userId, 10);
+        String shortCode = shortUrl.getShortCode();
 
         Optional<String> result = service.processClick(shortCode);
 
@@ -133,125 +110,116 @@ class LinkManagementServiceTest {
 
     @Test
     void shouldNotProcessClickForExpiredUrl() {
-        String shortCode = "abc123";
-        ShortUrl shortUrl = new ShortUrl(
-                shortCode,
+        // Create expired URL manually
+        UUID userId = service.createUser();
+        ShortUrl expiredUrl = new ShortUrl(
+                "expired",
                 "https://example.com",
-                UUID.randomUUID(),
-                Instant.now(),
+                userId,
+                Instant.now().minusSeconds(1000),
                 Instant.now().minusSeconds(1), // Expired
                 10
         );
+        shortUrlRepository.save(expiredUrl);
 
-        when(shortUrlRepository.findByShortCode(shortCode)).thenReturn(Optional.of(shortUrl));
-
-        Optional<String> result = service.processClick(shortCode);
+        Optional<String> result = service.processClick("expired");
 
         assertThat(result).isEmpty();
-        verify(notificationService).notifyLinkExpired(shortCode, "https://example.com");
+        assertThat(expiredUrl.getClickCount()).isZero(); // No click processed
     }
 
     @Test
     void shouldNotProcessClickWhenLimitReached() {
-        String shortCode = "abc123";
-        ShortUrl shortUrl = new ShortUrl(
-                shortCode,
-                "https://example.com",
-                UUID.randomUUID(),
-                Instant.now(),
-                Instant.now().plusSeconds(3600),
-                1
-        );
-        shortUrl.incrementClickCount(); // Reach limit
+        UUID userId = service.createUser();
+        ShortUrl shortUrl = service.createShortUrl("https://example.com", userId, 2);
+        String shortCode = shortUrl.getShortCode();
 
-        when(shortUrlRepository.findByShortCode(shortCode)).thenReturn(Optional.of(shortUrl));
+        // Consume all clicks
+        service.processClick(shortCode);
+        service.processClick(shortCode);
 
+        // Next click should fail
         Optional<String> result = service.processClick(shortCode);
 
         assertThat(result).isEmpty();
-        verify(notificationService).notifyClickLimitReached(shortCode, "https://example.com", 1);
+        assertThat(shortUrl.getClickCount()).isEqualTo(2);
     }
 
     @Test
     void shouldUpdateClickLimit() {
-        String shortCode = "abc123";
-        UUID ownerId = UUID.randomUUID();
-        ShortUrl shortUrl = new ShortUrl(
-                shortCode,
-                "https://example.com",
-                ownerId,
-                Instant.now(),
-                Instant.now().plusSeconds(3600),
-                10
-        );
+        UUID userId = service.createUser();
+        ShortUrl shortUrl = service.createShortUrl("https://example.com", userId, 10);
+        String shortCode = shortUrl.getShortCode();
 
-        when(shortUrlRepository.findByShortCode(shortCode)).thenReturn(Optional.of(shortUrl));
-
-        service.updateClickLimit(shortCode, ownerId, 50);
+        service.updateClickLimit(shortCode, userId, 50);
 
         assertThat(shortUrl.getClickLimit()).isEqualTo(50);
     }
 
     @Test
     void shouldThrowExceptionWhenNonOwnerTriesToUpdate() {
-        String shortCode = "abc123";
-        UUID ownerId = UUID.randomUUID();
-        UUID otherUserId = UUID.randomUUID();
-        ShortUrl shortUrl = new ShortUrl(
-                shortCode,
-                "https://example.com",
-                ownerId,
-                Instant.now(),
-                Instant.now().plusSeconds(3600),
-                10
-        );
+        UUID owner = service.createUser();
+        UUID otherUser = service.createUser();
+        ShortUrl shortUrl = service.createShortUrl("https://example.com", owner, 10);
 
-        when(shortUrlRepository.findByShortCode(shortCode)).thenReturn(Optional.of(shortUrl));
-
-        assertThatThrownBy(() -> service.updateClickLimit(shortCode, otherUserId, 50))
+        assertThatThrownBy(() -> service.updateClickLimit(shortUrl.getShortCode(), otherUser, 50))
                 .isInstanceOf(SecurityException.class)
                 .hasMessageContaining("нет прав");
     }
 
     @Test
     void shouldDeleteShortUrl() {
-        String shortCode = "abc123";
-        UUID ownerId = UUID.randomUUID();
-        ShortUrl shortUrl = new ShortUrl(
-                shortCode,
-                "https://example.com",
-                ownerId,
-                Instant.now(),
-                Instant.now().plusSeconds(3600),
-                10
-        );
+        UUID userId = service.createUser();
+        ShortUrl shortUrl = service.createShortUrl("https://example.com", userId, 10);
+        String shortCode = shortUrl.getShortCode();
 
-        when(shortUrlRepository.findByShortCode(shortCode)).thenReturn(Optional.of(shortUrl));
+        service.deleteShortUrl(shortCode, userId);
 
-        service.deleteShortUrl(shortCode, ownerId);
-
-        verify(shortUrlRepository).delete(shortCode);
+        assertThat(shortUrlRepository.exists(shortCode)).isFalse();
     }
 
     @Test
     void shouldThrowExceptionWhenNonOwnerTriesToDelete() {
-        String shortCode = "abc123";
-        UUID ownerId = UUID.randomUUID();
-        UUID otherUserId = UUID.randomUUID();
-        ShortUrl shortUrl = new ShortUrl(
-                shortCode,
-                "https://example.com",
-                ownerId,
-                Instant.now(),
-                Instant.now().plusSeconds(3600),
-                10
-        );
+        UUID owner = service.createUser();
+        UUID otherUser = service.createUser();
+        ShortUrl shortUrl = service.createShortUrl("https://example.com", owner, 10);
 
-        when(shortUrlRepository.findByShortCode(shortCode)).thenReturn(Optional.of(shortUrl));
-
-        assertThatThrownBy(() -> service.deleteShortUrl(shortCode, otherUserId))
+        assertThatThrownBy(() -> service.deleteShortUrl(shortUrl.getShortCode(), otherUser))
                 .isInstanceOf(SecurityException.class)
                 .hasMessageContaining("нет прав");
+    }
+
+    @Test
+    void shouldGetUserLinks() {
+        UUID userId = service.createUser();
+        service.createShortUrl("https://example1.com", userId, null);
+        service.createShortUrl("https://example2.com", userId, null);
+
+        assertThat(service.getUserLinks(userId)).hasSize(2);
+    }
+
+    @Test
+    void shouldCleanupExpiredLinks() {
+        UUID userId = service.createUser();
+        
+        // Create expired link
+        ShortUrl expiredUrl = new ShortUrl(
+                "expired",
+                "https://expired.com",
+                userId,
+                Instant.now().minusSeconds(1000),
+                Instant.now().minusSeconds(1),
+                100
+        );
+        shortUrlRepository.save(expiredUrl);
+        
+        // Create active link
+        service.createShortUrl("https://active.com", userId, null);
+
+        int deleted = service.cleanupExpiredLinks();
+
+        assertThat(deleted).isEqualTo(1);
+        assertThat(shortUrlRepository.exists("expired")).isFalse();
     }
 }
 
